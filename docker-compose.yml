@@ -5,8 +5,10 @@ services:
     image: nguonc-stremio:local
     env_file:
       - ${ENV_FILE:-.env}
-    ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+    expose:
+      - "${PORT:-3000}"
+    networks:
+      - web_network
     restart: unless-stopped
     healthcheck:
       test:
@@ -17,3 +19,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+networks:
+  web_network:
+    external: true
+    name: ${WEB_NETWORK:-web_network}
