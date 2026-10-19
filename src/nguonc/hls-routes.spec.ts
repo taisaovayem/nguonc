@@ -10,11 +10,14 @@ describe('HLS routes', () => {
       publicBaseUrl: 'https://nguonc.taisaovayem.com',
       idGenerator: sequence('session', 'segment'),
     });
-    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts\n'));
+    proxy.createSession({
+      ...sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts\n'),
+      playlistName: 'phim-test-tap-1',
+    });
     const app = express();
     registerHlsRoutes(app, proxy);
 
-    const response = await request(app).get('/hls/session/playlist.m3u8');
+    const response = await request(app).get('/hls/session/phim-test-tap-1.m3u8');
 
     expect(response.status).toBe(200);
     expect(response.headers['content-type']).toContain('application/vnd.apple.mpegurl');

@@ -56,7 +56,12 @@ export class NguoncAddonService {
         .map((episode) => ({ server: server.server_name, episode })),
     );
     const resolved: Array<StremioStream | undefined> = await Promise.all(candidates.map(async ({ server, episode }) => {
-      const url = await this.cache.getOrLoad(`stream:${episode.embed}`, this.cacheOptions.streamTtlMs ?? 15 * 60_000, () => this.resolver.resolve(episode.embed));
+      const playlistName = type === 'series' ? `${movie.name} Tập ${episode.name}` : movie.name;
+      const url = await this.cache.getOrLoad(
+        `stream:${episode.embed}`,
+        this.cacheOptions.streamTtlMs ?? 15 * 60_000,
+        () => this.resolver.resolve(episode.embed, playlistName),
+      );
       if (!url) return undefined;
       const description = `${movie.quality ?? ''} ${movie.language ?? ''}`.trim();
       return {

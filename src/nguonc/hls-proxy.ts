@@ -64,7 +64,7 @@ export class HlsProxy implements HlsProxyPort {
 
     session.rootPlaylist = playlist;
     this.sessions.set(sessionId, session);
-    return new URL(`hls/${sessionId}/playlist.m3u8`, this.publicBaseUrl).toString();
+    return new URL(`hls/${sessionId}/${playlistFilename(input.playlistName)}`, this.publicBaseUrl).toString();
   }
 
   getRootPlaylist(sessionId: string): string | undefined {
@@ -178,4 +178,15 @@ function requestOrigin(value: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function playlistFilename(value: string | undefined): string {
+  const slug = value
+    ?.normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/đ/gi, 'd')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `${slug || 'playlist'}.m3u8`;
 }

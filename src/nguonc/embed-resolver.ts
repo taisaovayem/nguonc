@@ -2,6 +2,7 @@ import { webcrypto } from 'node:crypto';
 
 export interface HlsSessionInput {
   playlist: string;
+  playlistName?: string;
   sourceUrl: string;
   refererUrl?: string;
   expiresAt: number;
@@ -52,7 +53,7 @@ export class EmbedResolver {
     this.fetcher = options.fetcher ?? fetch;
   }
 
-  async resolve(embedUrl: string): Promise<string | undefined> {
+  async resolve(embedUrl: string, playlistName?: string): Promise<string | undefined> {
     if (!this.options.playlistPublisher) return undefined;
 
     const embed = parseEmbedUrl(embedUrl);
@@ -83,6 +84,7 @@ export class EmbedResolver {
       const playlist = await decryptPlaylist(await playlistResponse.text());
       return this.options.playlistPublisher.createSession({
         playlist,
+        playlistName,
         sourceUrl: playlistResponse.url || grant.playlist,
         refererUrl: embed.url.toString(),
         expiresAt: grant.expiresAt * 1_000,

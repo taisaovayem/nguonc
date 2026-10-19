@@ -2,7 +2,7 @@ import type { Express } from 'express';
 import { HlsProxy } from './hls-proxy.js';
 
 export function registerHlsRoutes(app: Express, proxy: HlsProxy): void {
-  app.get('/hls/:sessionId/playlist.m3u8', (request, response) => {
+  app.get('/hls/:sessionId/:playlistName.m3u8', (request, response) => {
     const playlist = proxy.getRootPlaylist(request.params.sessionId);
     if (!playlist) {
       response.sendStatus(404);

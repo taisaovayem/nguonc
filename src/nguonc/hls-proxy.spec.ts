@@ -16,6 +16,20 @@ describe('HlsProxy', () => {
     );
   });
 
+  it('uses a URL-safe movie name for the public playlist filename', () => {
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      idGenerator: sequence('session', 'segment'),
+    });
+
+    const url = proxy.createSession({
+      ...sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts\n'),
+      playlistName: 'Bleach: Huyết Chiến Ngàn Năm – Kiếp Nạn Tập 1',
+    });
+
+    expect(url).toBe('https://nguonc.taisaovayem.com/hls/session/bleach-huyet-chien-ngan-nam-kiep-nan-tap-1.m3u8');
+  });
+
   it('keeps a public URL path prefix on playlist resources', () => {
     const proxy = new HlsProxy({
       publicBaseUrl: 'https://nguonc.taisaovayem.com/addon',

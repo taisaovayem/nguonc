@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { NguoncAddonService } from './addon.service.js';
 import { NguoncMovie } from './types.js';
 
@@ -21,11 +21,12 @@ describe('NguoncAddonService', () => {
       listLatest: async () => ({ items: [], paginate: { current_page: 1 } }),
       search: async () => ({ items: [], paginate: { current_page: 1 } }),
     };
-    const resolver = { resolve: async (url: string) => url.endsWith('/a') ? 'https://nguonc.taisaovayem.com/hls/session/playlist.m3u8' : undefined };
+    const resolver = { resolve: vi.fn(async (url: string) => url.endsWith('/a') ? 'https://nguonc.taisaovayem.com/hls/session/phim-test-tap-1.m3u8' : undefined) };
     const service = new NguoncAddonService(client, resolver);
 
     await expect(service.streams('series', 'nguonc:phim-test:tap-1')).resolves.toEqual([
-      expect.objectContaining({ name: 'NguồnC • Vietsub #1', url: 'https://nguonc.taisaovayem.com/hls/session/playlist.m3u8' }),
+      expect.objectContaining({ name: 'NguồnC • Vietsub #1', url: 'https://nguonc.taisaovayem.com/hls/session/phim-test-tap-1.m3u8' }),
     ]);
+    expect(resolver.resolve).toHaveBeenCalledWith('https://embed.example/a', 'Phim test Tập 1');
   });
 });
