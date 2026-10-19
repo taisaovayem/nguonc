@@ -2,6 +2,8 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module.js';
 import { createRequire } from 'node:module';
 import { EmbedResolver } from './nguonc/embed-resolver.js';
+import { HlsProxy } from './nguonc/hls-proxy.js';
+import { registerHlsRoutes } from './nguonc/hls-routes.js';
 import { NguoncAddonService } from './nguonc/addon.service.js';
 import { NguoncClient } from './nguonc/nguonc.client.js';
 import { createAddonInterface } from './stremio-addon.factory.js';
@@ -12,8 +14,13 @@ const { getRouter } = require('stremio-addon-sdk') as { getRouter: (addon: unkno
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const timeoutMs = numberSetting('REQUEST_TIMEOUT_MS', 8_000);
+  const hlsProxy = new HlsProxy({
+    publicBaseUrl: publicBaseUrlSetting(),
+    timeoutMs,
+  });
   const resolver = new EmbedResolver({
-    allowedHosts: (process.env.EMBED_ALLOWED_HOSTS ?? 'embed.streamc.xyz').split(',').map((host) => host.trim()).filter(Boolean),
+    allowedHosts: (process.env.EMBED_ALLOWED_HOSTS ?? 'streamc.xyz').split(',').map((host) => host.trim()).filter(Boolean),
+    playlistPublisher: hlsProxy,
     timeoutMs,
   });
   const client = new NguoncClient({
@@ -25,7 +32,9 @@ async function bootstrap() {
     detailTtlMs: numberSetting('DETAIL_CACHE_TTL_MS', 15 * 60_000),
     streamTtlMs: numberSetting('STREAM_CACHE_TTL_MS', 15 * 60_000),
   }));
-  (app.getHttpAdapter().getInstance() as { use(router: unknown): void }).use(getRouter(addon));
+  const httpServer = app.getHttpAdapter().getInstance();
+  registerHlsRoutes(httpServer, hlsProxy);
+  (httpServer as { use(router: unknown): void }).use(getRouter(addon));
   await app.listen(process.env.PORT ?? 3000);
 }
 await bootstrap();
@@ -33,4 +42,15 @@ await bootstrap();
 function numberSetting(name: string, fallback: number): number {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function publicBaseUrlSetting(): string {
+  const value = process.env.PUBLIC_BASE_URL;
+  if (!value) throw new Error('PUBLIC_BASE_URL must be configured');
+
+  const url = new URL(value);
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    throw new Error('PUBLIC_BASE_URL must be an HTTPS origin without credentials, query, or fragment');
+  }
+  return url.toString();
 }

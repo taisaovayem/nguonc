@@ -21,11 +21,11 @@ describe('NguoncAddonService', () => {
       listLatest: async () => ({ items: [], paginate: { current_page: 1 } }),
       search: async () => ({ items: [], paginate: { current_page: 1 } }),
     };
-    const resolver = { resolve: async (url: string) => url.endsWith('/a') ? 'https://cdn.example/a.m3u8' : undefined };
+    const resolver = { resolve: async (url: string) => url.endsWith('/a') ? 'https://nguonc.taisaovayem.com/hls/session/playlist.m3u8' : undefined };
     const service = new NguoncAddonService(client, resolver);
 
     await expect(service.streams('series', 'nguonc:phim-test:tap-1')).resolves.toEqual([
-      expect.objectContaining({ name: 'NguồnC • Vietsub #1', url: 'https://cdn.example/a.m3u8' }),
+      expect.objectContaining({ name: 'NguồnC • Vietsub #1', url: 'https://nguonc.taisaovayem.com/hls/session/playlist.m3u8' }),
     ]);
   });
 });
