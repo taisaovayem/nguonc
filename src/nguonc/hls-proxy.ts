@@ -243,6 +243,8 @@ export class HlsProxy implements HlsProxyPort {
     } catch {
       return undefined;
     }
+    const resources = new Map(session.resources);
+    const resourceIds = new Map(session.resourceIds);
 
     const rewriteUri = (value: string): { path: string; resourceId: string } | undefined => {
       let url: URL;
@@ -252,13 +254,13 @@ export class HlsProxy implements HlsProxyPort {
         return undefined;
       }
       const resourceKey = resourceIdentity(url);
-      const existing = session.resourceIds.get(resourceKey);
+      const existing = resourceIds.get(resourceKey);
       const resourceId = existing ?? this.nextId();
       if (!resourceId) return undefined;
       if (!existing) {
-        session.resourceIds.set(resourceKey, resourceId);
+        resourceIds.set(resourceKey, resourceId);
       }
-      session.resources.set(resourceId, url);
+      resources.set(resourceId, url);
       return { path: new URL(`hls/${sessionId}/resource/${resourceId}`, this.publicBaseUrl).pathname, resourceId };
     };
 
@@ -292,6 +294,8 @@ export class HlsProxy implements HlsProxyPort {
       if (invalid) return undefined;
       rewrittenLines.push(rewritten);
     }
+    session.resources = resources;
+    session.resourceIds = resourceIds;
     return { body: rewrittenLines.join('\n'), mediaResourceIds };
   }
 

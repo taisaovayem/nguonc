@@ -362,6 +362,29 @@ describe('HlsProxy', () => {
     expect(refresh).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps every old resource mapping when a refreshed playlist cannot be rewritten', async () => {
+    const refresh = vi.fn(async () => ({
+      playlist: '#EXTM3U\n#EXTINF:2,\none.ts?signature=new\n#EXTINF:2,\nhttp://[invalid-url\n',
+      sourceUrl: 'https://embed15.streamc.xyz/signed-playlist',
+      expiresAt: 7_200_000,
+    }));
+    const fetcher = vi.fn<typeof fetch>(async (input) => new Response(
+      input instanceof URL && input.searchParams.get('signature') === 'old' ? new Uint8Array([1]) : new Uint8Array([9]),
+      { headers: { 'Content-Type': 'video/mp2t' } },
+    ));
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      now: () => 3_480_000,
+      prefetchSegments: 0,
+      idGenerator: sequence('session', 'one', 'unused'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\none.ts?signature=old\n', { expiresAt: 3_600_000, refresh }));
+
+    await expect(proxy.getResource('session', 'one')).resolves.toMatchObject({ body: new Uint8Array([1]) });
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
   it('removes an expired session when its refresh fails without fetching the stale resource', async () => {
     let now = 0;
     const refresh = vi.fn(async () => undefined);
