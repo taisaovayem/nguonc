@@ -58,7 +58,7 @@ describe('HlsProxy', () => {
   });
 
   it('forwards a range request for a registered binary segment', async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new Uint8Array([1, 2, 3]), {
       status: 206,
       headers: { 'Content-Type': 'video/mp2t', 'Content-Range': 'bytes 100-102/400' },
     }));
@@ -73,7 +73,7 @@ describe('HlsProxy', () => {
 
     expect(response).toMatchObject({ status: 206, contentType: 'video/mp2t', contentRange: 'bytes 100-102/400' });
     expect(response?.body).toEqual(new Uint8Array([1, 2, 3]));
-    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('range')).toBe('bytes=100-');
+    expect(fetcher.mock.calls.some(([, options]) => new Headers(options?.headers).get('range') === 'bytes=100-')).toBe(true);
   });
 
   it('uses the embed origin as the referer for CDN-hosted segments', async () => {
@@ -110,6 +110,122 @@ describe('HlsProxy', () => {
     const response = await proxy.getResource('session', 'nested');
 
     expect(new TextDecoder().decode(response?.body)).toBe('#EXTM3U\n#EXTINF:2,\n/hls/session/resource/chunk\n');
+  });
+
+  it('serves a prefetched segment once before releasing it from RAM', async () => {
+    let segmentRequests = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      segmentRequests += 1;
+      return new Response(new Uint8Array([segmentRequests === 1 ? 1 : 9]), {
+        headers: { 'Content-Type': 'video/mp2t' },
+      });
+    });
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      prefetchSegments: 1,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts\n'));
+
+    await vi.waitFor(() => expect(segmentRequests).toBe(1));
+
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([1]) });
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([9]) });
+  });
+
+  it('releases a prefetched segment when the player requests a byte range', async () => {
+    let segmentRequests = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      segmentRequests += 1;
+      const byte = segmentRequests === 1 ? 1 : segmentRequests === 2 ? 5 : 9;
+      return new Response(new Uint8Array([byte]), { headers: { 'Content-Type': 'video/mp2t' } });
+    });
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      prefetchSegments: 1,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts\n'));
+
+    await vi.waitFor(() => expect(segmentRequests).toBe(1));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    await expect(proxy.getResource('session', 'segment', 'bytes=0-')).resolves.toMatchObject({ body: new Uint8Array([5]) });
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([9]) });
+  });
+
+  it('prefetches segments after the segment the player seeks to', async () => {
+    const requests: string[] = [];
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const url = input instanceof URL ? input.toString() : typeof input === 'string' ? input : input.url;
+      requests.push(url);
+      const byte = url.includes('four.ts') ? 4 : url.includes('three.ts') ? 3 : 1;
+      return new Response(new Uint8Array([byte]), { headers: { 'Content-Type': 'video/mp2t' } });
+    });
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      prefetchSegments: 1,
+      idGenerator: sequence('session', 'one', 'two', 'three', 'four'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\none.ts\n#EXTINF:2,\ntwo.ts\n#EXTINF:2,\nthree.ts\n#EXTINF:2,\nfour.ts\n'));
+
+    await vi.waitFor(() => expect(requests).toContain('https://embed15.streamc.xyz/one.ts'));
+    await expect(proxy.getResource('session', 'three')).resolves.toMatchObject({ body: new Uint8Array([3]) });
+    await vi.waitFor(() => expect(requests).toContain('https://embed15.streamc.xyz/four.ts'));
+
+    await expect(proxy.getResource('session', 'four')).resolves.toMatchObject({ body: new Uint8Array([4]) });
+  });
+
+  it('discards an unused prefetched segment after its idle TTL', async () => {
+    let now = 0;
+    let segmentRequests = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      segmentRequests += 1;
+      return new Response(new Uint8Array([segmentRequests === 1 ? 1 : 9]), {
+        headers: { 'Content-Type': 'video/mp2t' },
+      });
+    });
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      now: () => now,
+      prefetchSegments: 1,
+      cacheIdleTtlMs: 30 * 60_000,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts\n', { expiresAt: 60 * 60_000 }));
+
+    await vi.waitFor(() => expect(segmentRequests).toBe(1));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    now = 30 * 60_000 + 1;
+
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([9]) });
+  });
+
+  it('does not retain a prefetched segment larger than the shared RAM budget', async () => {
+    let segmentRequests = 0;
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      segmentRequests += 1;
+      return new Response(new Uint8Array(segmentRequests === 1 ? [1, 2] : [9, 9]), {
+        headers: { 'Content-Type': 'video/mp2t' },
+      });
+    });
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      prefetchSegments: 1,
+      cacheMaxBytes: 1,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts\n'));
+
+    await vi.waitFor(() => expect(segmentRequests).toBe(1));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([9, 9]) });
   });
 });
 

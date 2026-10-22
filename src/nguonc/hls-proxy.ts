@@ -4,6 +4,9 @@ import type { HlsProxyPort, HlsSessionInput } from './embed-resolver.js';
 export interface HlsProxyOptions {
   publicBaseUrl: string;
   timeoutMs?: number;
+  prefetchSegments?: number;
+  cacheMaxBytes?: number;
+  cacheIdleTtlMs?: number;
   fetcher?: typeof fetch;
   now?: () => number;
   idGenerator?: () => string;
@@ -24,6 +27,19 @@ interface HlsSession {
   resources: Map<string, URL>;
   resourceIds: Map<string, string>;
   rootPlaylist: string;
+  cachedResources: Map<string, CachedResource>;
+  inFlightResources: Map<string, Promise<HlsProxyResponse>>;
+  prefetchTargets: Map<string, string[]>;
+  consumedResourceIds: Set<string>;
+}
+
+interface CachedResource extends HlsProxyResponse {
+  cachedAt: number;
+}
+
+interface RewrittenPlaylist {
+  body: string;
+  mediaResourceIds: string[];
 }
 
 const BROWSER_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36';
@@ -31,17 +47,27 @@ const BROWSER_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (
 export class HlsProxy implements HlsProxyPort {
   private readonly publicBaseUrl: URL;
   private readonly timeoutMs: number;
+  private readonly prefetchSegments: number;
+  private readonly cacheMaxBytes: number;
+  private readonly cacheIdleTtlMs: number;
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
   private readonly idGenerator: () => string;
   private readonly sessions = new Map<string, HlsSession>();
+  private readonly cacheCleanupTimer: NodeJS.Timeout;
+  private cachedBytes = 0;
 
   constructor(options: HlsProxyOptions) {
     this.publicBaseUrl = new URL(options.publicBaseUrl.endsWith('/') ? options.publicBaseUrl : `${options.publicBaseUrl}/`);
     this.timeoutMs = options.timeoutMs ?? 8_000;
+    this.prefetchSegments = Math.max(0, Math.floor(options.prefetchSegments ?? 15));
+    this.cacheMaxBytes = options.cacheMaxBytes ?? 1024 * 1024 * 1024;
+    this.cacheIdleTtlMs = options.cacheIdleTtlMs ?? 30 * 60_000;
     this.fetcher = options.fetcher ?? fetch;
     this.now = options.now ?? Date.now;
     this.idGenerator = options.idGenerator ?? randomUUID;
+    this.cacheCleanupTimer = setInterval(() => this.purgeExpiredCache(), Math.max(1_000, Math.min(this.cacheIdleTtlMs, 60_000)));
+    this.cacheCleanupTimer.unref();
   }
 
   createSession(input: HlsSessionInput): string | undefined {
@@ -58,12 +84,18 @@ export class HlsProxy implements HlsProxyPort {
       resources: new Map(),
       resourceIds: new Map(),
       rootPlaylist: '',
+      cachedResources: new Map(),
+      inFlightResources: new Map(),
+      prefetchTargets: new Map(),
+      consumedResourceIds: new Set(),
     };
-    const playlist = this.rewritePlaylist(sessionId, session, input.playlist, input.sourceUrl);
-    if (!playlist) return undefined;
+    const rewritten = this.rewritePlaylist(sessionId, session, input.playlist, input.sourceUrl);
+    if (!rewritten) return undefined;
 
-    session.rootPlaylist = playlist;
+    session.rootPlaylist = rewritten.body;
     this.sessions.set(sessionId, session);
+    this.configurePrefetchTargets(session, rewritten.mediaResourceIds);
+    this.prefetchResources(sessionId, session, rewritten.mediaResourceIds);
     return new URL(`hls/${sessionId}/${playlistFilename(input.playlistName)}`, this.publicBaseUrl).toString();
   }
 
@@ -75,6 +107,37 @@ export class HlsProxy implements HlsProxyPort {
     const session = this.getSession(sessionId);
     const sourceUrl = session?.resources.get(resourceId);
     if (!session || !sourceUrl) return undefined;
+    const cached = range ? undefined : this.takeCachedResource(session, resourceId);
+    session.consumedResourceIds.add(resourceId);
+    if (range) this.removeCachedResource(session, resourceId);
+
+    if (!range) {
+      if (cached) {
+        this.prefetchAfter(sessionId, session, resourceId);
+        return cached;
+      }
+
+      const inFlight = session.inFlightResources.get(resourceId);
+      if (inFlight) {
+        const resource = await inFlight;
+        this.removeCachedResource(session, resourceId);
+        this.prefetchAfter(sessionId, session, resourceId);
+        return resource;
+      }
+    }
+
+    const resource = await this.fetchResource(sessionId, session, resourceId, sourceUrl, range);
+    this.prefetchAfter(sessionId, session, resourceId);
+    return resource;
+  }
+
+  private async fetchResource(
+    sessionId: string,
+    session: HlsSession,
+    resourceId: string,
+    sourceUrl: URL,
+    range?: string,
+  ): Promise<HlsProxyResponse> {
 
     const response = await this.fetcher(sourceUrl, {
       headers: {
@@ -91,8 +154,10 @@ export class HlsProxy implements HlsProxyPort {
     if (isHls && response.ok) {
       const decrypted = await session.decryptPlaylist(new TextDecoder('utf-8', { fatal: true }).decode(body));
       const playlist = this.rewritePlaylist(sessionId, session, decrypted, response.url || sourceUrl.toString());
-      if (!playlist) return undefined;
-      return { status: response.status, body: new TextEncoder().encode(playlist), contentType: 'application/vnd.apple.mpegurl' };
+      if (!playlist) throw new Error('Unable to rewrite HLS playlist');
+      this.configurePrefetchTargets(session, playlist.mediaResourceIds);
+      this.prefetchResources(sessionId, session, playlist.mediaResourceIds);
+      return { status: response.status, body: new TextEncoder().encode(playlist.body), contentType: 'application/vnd.apple.mpegurl' };
     }
 
     return {
@@ -106,11 +171,11 @@ export class HlsProxy implements HlsProxyPort {
 
   private getSession(sessionId: string): HlsSession | undefined {
     const session = this.sessions.get(sessionId);
-    if (session && session.expiresAt <= this.now()) this.sessions.delete(sessionId);
+    if (session && session.expiresAt <= this.now()) this.deleteSession(sessionId, session);
     return this.sessions.get(sessionId);
   }
 
-  private rewritePlaylist(sessionId: string, session: HlsSession, playlist: string, sourceUrl: string): string | undefined {
+  private rewritePlaylist(sessionId: string, session: HlsSession, playlist: string, sourceUrl: string): RewrittenPlaylist | undefined {
     let baseUrl: URL;
     try {
       baseUrl = new URL(sourceUrl);
@@ -118,7 +183,7 @@ export class HlsProxy implements HlsProxyPort {
       return undefined;
     }
 
-    const rewriteUri = (value: string): string | undefined => {
+    const rewriteUri = (value: string): { path: string; resourceId: string } | undefined => {
       let url: URL;
       try {
         url = new URL(value, baseUrl);
@@ -134,31 +199,128 @@ export class HlsProxy implements HlsProxyPort {
         session.resourceIds.set(url.toString(), resourceId);
         session.resources.set(resourceId, url);
       }
-      return new URL(`hls/${sessionId}/resource/${resourceId}`, this.publicBaseUrl).pathname;
+      return { path: new URL(`hls/${sessionId}/resource/${resourceId}`, this.publicBaseUrl).pathname, resourceId };
     };
 
     const rewrittenLines: string[] = [];
+    const mediaResourceIds: string[] = [];
+    let expectsMediaUri = false;
     for (const line of playlist.split(/\r?\n/)) {
-      if (!line || line.startsWith('#EXTINF:')) {
+      if (!line) {
+        rewrittenLines.push(line);
+        continue;
+      }
+      if (line.startsWith('#EXTINF:')) {
+        expectsMediaUri = true;
         rewrittenLines.push(line);
         continue;
       }
       if (!line.startsWith('#')) {
         const rewritten = rewriteUri(line);
         if (rewritten === undefined) return undefined;
-        rewrittenLines.push(rewritten);
+        if (expectsMediaUri) mediaResourceIds.push(rewritten.resourceId);
+        expectsMediaUri = false;
+        rewrittenLines.push(rewritten.path);
         continue;
       }
       let invalid = false;
       const rewritten = line.replace(/URI="([^"]+)"/g, (_match, value: string) => {
         const uri = rewriteUri(value);
         if (!uri) invalid = true;
-        return uri ? `URI="${uri}"` : _match;
+        return uri ? `URI="${uri.path}"` : _match;
       });
       if (invalid) return undefined;
       rewrittenLines.push(rewritten);
     }
-    return rewrittenLines.join('\n');
+    return { body: rewrittenLines.join('\n'), mediaResourceIds };
+  }
+
+  private configurePrefetchTargets(session: HlsSession, mediaResourceIds: string[]): void {
+    for (let index = 0; index < mediaResourceIds.length; index += 1) {
+      session.prefetchTargets.set(mediaResourceIds[index], mediaResourceIds.slice(index + 1, index + 1 + this.prefetchSegments));
+    }
+  }
+
+  private prefetchAfter(sessionId: string, session: HlsSession, resourceId: string): void {
+    this.prefetchResources(sessionId, session, session.prefetchTargets.get(resourceId) ?? []);
+  }
+
+  private prefetchResources(sessionId: string, session: HlsSession, resourceIds: string[]): void {
+    this.purgeExpiredCache();
+    for (const resourceId of resourceIds.slice(0, this.prefetchSegments)) {
+      if (session.consumedResourceIds.has(resourceId) || session.cachedResources.has(resourceId) || session.inFlightResources.has(resourceId)) continue;
+      const sourceUrl = session.resources.get(resourceId);
+      if (!sourceUrl) continue;
+
+      const inFlight = this.fetchResource(sessionId, session, resourceId, sourceUrl);
+      session.inFlightResources.set(resourceId, inFlight);
+      void inFlight.then((resource) => {
+        if (!session.consumedResourceIds.has(resourceId) && resource.status >= 200 && resource.status < 300 && !resource.contentType?.includes('mpegurl')) {
+          this.cacheResource(session, resourceId, resource);
+        }
+      }).catch(() => undefined).finally(() => {
+        session.inFlightResources.delete(resourceId);
+      });
+    }
+  }
+
+  private cacheResource(session: HlsSession, resourceId: string, resource: HlsProxyResponse): void {
+    const size = resource.body.byteLength;
+    if (size > this.cacheMaxBytes) return;
+    this.removeCachedResource(session, resourceId);
+    this.purgeExpiredCache();
+    while (this.cachedBytes + size > this.cacheMaxBytes && this.evictOldestCachedResource()) {
+      // Evict until this response fits the configured shared memory budget.
+    }
+    if (this.cachedBytes + size > this.cacheMaxBytes) return;
+    session.cachedResources.set(resourceId, { ...resource, cachedAt: this.now() });
+    this.cachedBytes += size;
+  }
+
+  private takeCachedResource(session: HlsSession, resourceId: string): HlsProxyResponse | undefined {
+    this.purgeExpiredCache();
+    const resource = session.cachedResources.get(resourceId);
+    if (!resource) return undefined;
+    this.removeCachedResource(session, resourceId);
+    const { cachedAt: _cachedAt, ...response } = resource;
+    return response;
+  }
+
+  private removeCachedResource(session: HlsSession, resourceId: string): void {
+    const resource = session.cachedResources.get(resourceId);
+    if (!resource) return;
+    session.cachedResources.delete(resourceId);
+    this.cachedBytes -= resource.body.byteLength;
+  }
+
+  private purgeExpiredCache(): void {
+    const now = this.now();
+    for (const [sessionId, session] of this.sessions) {
+      if (session.expiresAt <= now) {
+        this.deleteSession(sessionId, session);
+        continue;
+      }
+      for (const [resourceId, resource] of session.cachedResources) {
+        if (resource.cachedAt + this.cacheIdleTtlMs <= now) this.removeCachedResource(session, resourceId);
+      }
+    }
+  }
+
+  private evictOldestCachedResource(): boolean {
+    let oldest: { session: HlsSession; resourceId: string; cachedAt: number } | undefined;
+    for (const session of this.sessions.values()) {
+      for (const [resourceId, resource] of session.cachedResources) {
+        if (!oldest || resource.cachedAt < oldest.cachedAt) oldest = { session, resourceId, cachedAt: resource.cachedAt };
+      }
+    }
+    if (!oldest) return false;
+    this.removeCachedResource(oldest.session, oldest.resourceId);
+    return true;
+  }
+
+  private deleteSession(sessionId: string, session: HlsSession): void {
+    for (const resourceId of session.cachedResources.keys()) this.removeCachedResource(session, resourceId);
+    this.sessions.delete(sessionId);
   }
 
   private nextId(): string | undefined {

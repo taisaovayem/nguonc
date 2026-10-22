@@ -32,7 +32,7 @@ describe('HLS routes', () => {
   });
 
   it('preserves binary byte-range responses from registered resources', async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new Uint8Array([1, 2, 3]), {
       status: 206,
       headers: {
         'Content-Type': 'video/mp2t',

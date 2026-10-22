@@ -17,6 +17,9 @@ async function bootstrap() {
   const hlsProxy = new HlsProxy({
     publicBaseUrl: publicBaseUrlSetting(),
     timeoutMs,
+    prefetchSegments: numberSetting('HLS_PREFETCH_SEGMENTS', 15),
+    cacheMaxBytes: numberSetting('HLS_PREFETCH_CACHE_BYTES', 1024 * 1024 * 1024),
+    cacheIdleTtlMs: numberSetting('HLS_CACHE_IDLE_TTL_MS', 30 * 60_000),
   });
   const resolver = new EmbedResolver({
     allowedHosts: (process.env.EMBED_ALLOWED_HOSTS ?? 'streamc.xyz').split(',').map((host) => host.trim()).filter(Boolean),
