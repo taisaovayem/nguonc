@@ -60,6 +60,47 @@ describe('EmbedResolver', () => {
     await expect(resolver.resolve('https://untrusted.example/watch/abc')).resolves.toBeUndefined();
   });
 
+  it('keeps the embed data private while refreshing the StreamC grant', async () => {
+    const embedUrl = 'https://embed15.streamc.xyz/embed.php?hash=e98bc48528bc4c91980a653c79e38b16';
+    const initialSignedPlaylistUrl = 'https://embed15.streamc.xyz/signed-playlist-token-one';
+    const refreshedSignedPlaylistUrl = 'https://embed15.streamc.xyz/signed-playlist-token-two';
+    const initialPlaylist = '#EXTM3U\n#EXTINF:2,\nsegment0000.png?signature=old\n';
+    const refreshedPlaylist = '#EXTM3U\n#EXTINF:2,\nsegment0000.png?signature=new\n';
+    const initialBootstrap = await encryptBootstrap(embedUrl, {
+      api: embedUrl,
+      video: 'e98bc48528bc4c91980a653c79e38b16',
+      preissued: { playlist: initialSignedPlaylistUrl, issuedAt: 1_800_000_000, expiresAt: 1_800_003_600 },
+    });
+    const refreshedBootstrap = await encryptBootstrap(embedUrl, {
+      api: embedUrl,
+      video: 'e98bc48528bc4c91980a653c79e38b16',
+      preissued: { playlist: refreshedSignedPlaylistUrl, issuedAt: 1_800_003_600, expiresAt: 1_800_007_200 },
+    });
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify(initialBootstrap), { status: 200 }))
+      .mockResolvedValueOnce(new Response(await encryptPlaylist(initialPlaylist, 'e98bc48528bc4c91980a653c79e38b16'), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(refreshedBootstrap), { status: 200 }))
+      .mockResolvedValueOnce(new Response(await encryptPlaylist(refreshedPlaylist, 'e98bc48528bc4c91980a653c79e38b16'), { status: 200 }));
+    const playlistPublisher = { createSession: vi.fn(() => 'https://nguonc.taisaovayem.com/hls/session/playlist.m3u8') };
+    const resolver = new EmbedResolver({ fetcher, playlistPublisher });
+
+    const published = await resolver.resolve(embedUrl);
+    const session = playlistPublisher.createSession.mock.calls[0][0] as {
+      refresh?: () => Promise<{ playlist: string; sourceUrl: string; expiresAt: number } | undefined>;
+    };
+
+    await expect(session.refresh!()).resolves.toEqual({
+      playlist: refreshedPlaylist,
+      sourceUrl: refreshedSignedPlaylistUrl,
+      expiresAt: 1_800_007_200_000,
+    });
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(fetcher.mock.calls[2][0]).toEqual(new URL(embedUrl));
+    expect(fetcher.mock.calls[3][0]).toBe(refreshedSignedPlaylistUrl);
+    expect(published).not.toContain('e98bc48528bc4c91980a653c79e38b16');
+    expect(published).not.toContain('signed-playlist-token');
+  });
+
   it('resolves an HTTP embed and follows its signed playlist on another host', async () => {
     const embedUrl = 'http://embed.other.example/embed.php?hash=e98bc48528bc4c91980a653c79e38b16';
     const signedPlaylistUrl = 'http://playlist.other.example/signed-playlist-token';

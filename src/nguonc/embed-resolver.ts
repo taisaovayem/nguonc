@@ -2,12 +2,19 @@ import { webcrypto } from 'node:crypto';
 
 export interface HlsSessionInput {
   playlist: string;
-  playlistName?: string;
   sourceUrl: string;
-  refererUrl?: string;
   expiresAt: number;
-  videoHash: string;
+  refresh: () => Promise<HlsSessionRefresh | undefined>;
   decryptPlaylist: (encryptedPlaylist: string) => Promise<string>;
+  videoHash: string;
+  playlistName?: string;
+  refererUrl?: string;
+}
+
+export interface HlsSessionRefresh {
+  playlist: string;
+  sourceUrl: string;
+  expiresAt: number;
 }
 
 export interface HlsProxyPort {
@@ -57,36 +64,15 @@ export class EmbedResolver {
     if (!embed) return undefined;
 
     try {
-      const bootstrap = await this.bootstrap(embed.url, embed.hash);
-      if (!bootstrap) return undefined;
-
-      const grant = validateGrant(bootstrap.preissued);
-      if (!grant) return undefined;
-
-      const playlistResponse = await this.fetcher(grant.playlist, {
-        headers: streamHeaders(embed.url),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-      if (!playlistResponse.ok) return undefined;
-
-      const decryptPlaylist = async (encryptedPlaylist: string) => {
-        if (encryptedPlaylist.includes('#ENC-AESGCM') || encryptedPlaylist.includes('#EXT-X-B65')) {
-          return decryptStreamPlaylist(encryptedPlaylist, embed.hash);
-        }
-        if (!encryptedPlaylist.startsWith('#EXTM3U\\n') && !encryptedPlaylist.startsWith('#EXTM3U\\r\\n')) {
-          throw new Error('Expected an HLS playlist');
-        }
-        return encryptedPlaylist;
-      };
-      const playlist = await decryptPlaylist(await playlistResponse.text());
+      const refreshed = await this.loadPlaylist(embed.url, embed.hash);
+      if (!refreshed) return undefined;
       return this.options.playlistPublisher.createSession({
-        playlist,
+        ...refreshed,
         playlistName,
-        sourceUrl: playlistResponse.url || grant.playlist,
         refererUrl: embed.url.toString(),
-        expiresAt: grant.expiresAt * 1_000,
         videoHash: embed.hash,
-        decryptPlaylist,
+        decryptPlaylist: (encryptedPlaylist) => decryptPlaylistForVideo(encryptedPlaylist, embed.hash),
+        refresh: () => this.loadPlaylist(embed.url, embed.hash),
       });
     } catch {
       return undefined;
@@ -117,6 +103,26 @@ export class EmbedResolver {
     const payload = await response.json() as unknown;
     const bootstrap = await decryptBootstrap(payload, embedUrl);
     return isStreamBootstrap(bootstrap, embedUrl, videoHash) ? bootstrap : undefined;
+  }
+
+  private async loadPlaylist(embedUrl: URL, videoHash: string): Promise<HlsSessionRefresh | undefined> {
+    const bootstrap = await this.bootstrap(embedUrl, videoHash);
+    if (!bootstrap) return undefined;
+
+    const grant = validateGrant(bootstrap.preissued);
+    if (!grant) return undefined;
+
+    const playlistResponse = await this.fetcher(grant.playlist, {
+      headers: streamHeaders(embedUrl),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!playlistResponse.ok) return undefined;
+
+    return {
+      playlist: await decryptPlaylistForVideo(await playlistResponse.text(), videoHash),
+      sourceUrl: playlistResponse.url || grant.playlist,
+      expiresAt: grant.expiresAt * 1_000,
+    };
   }
 
 }
@@ -168,6 +174,16 @@ async function decryptStreamPlaylist(playlist: string, videoHash: string): Promi
   const decrypted = await decryptAesGcm({ format: 'aesgcm-v1', iv: match[1], data: lines[3] }, keyMaterial);
   if (!decrypted.startsWith('#EXTM3U\n') && !decrypted.startsWith('#EXTM3U\r\n')) throw new Error('Decrypted value is not an HLS playlist');
   return decrypted;
+}
+
+async function decryptPlaylistForVideo(playlist: string, videoHash: string): Promise<string> {
+  if (playlist.includes('#ENC-AESGCM') || playlist.includes('#EXT-X-B65')) {
+    return decryptStreamPlaylist(playlist, videoHash);
+  }
+  if (!playlist.startsWith('#EXTM3U\n') && !playlist.startsWith('#EXTM3U\r\n')) {
+    throw new Error('Expected an HLS playlist');
+  }
+  return playlist;
 }
 
 async function decryptAesGcm(envelope: AesGcmEnvelope, keyMaterial: BufferSource, additionalData?: Uint8Array): Promise<string> {
