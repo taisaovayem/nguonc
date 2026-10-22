@@ -283,15 +283,119 @@ describe('HlsProxy', () => {
 
     await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([9, 9]) });
   });
+
+  it('refreshes a near-expiry session while retaining its local resource URL', async () => {
+    let now = 3_480_000;
+    const requestedUrls: string[] = [];
+    const refresh = vi.fn(async () => ({
+      playlist: '#EXTM3U\n#EXTINF:2,\nsegment.ts?signature=new\n',
+      sourceUrl: 'https://embed15.streamc.xyz/signed-playlist',
+      expiresAt: 7_200_000,
+    }));
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      requestedUrls.push(input instanceof URL ? input.toString() : String(input));
+      return new Response(new Uint8Array([1]), { headers: { 'Content-Type': 'video/mp2t' } });
+    });
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      now: () => now,
+      prefetchSegments: 0,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts?signature=old\n', { expiresAt: 3_600_000, refresh }));
+
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([1]) });
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(requestedUrls).toEqual(['https://embed15.streamc.xyz/segment.ts?signature=new']);
+  });
+
+  it('shares one in-flight refresh between concurrent resource requests', async () => {
+    let releaseRefresh: ((value: { playlist: string; sourceUrl: string; expiresAt: number }) => void) | undefined;
+    const refresh = vi.fn(() => new Promise<{ playlist: string; sourceUrl: string; expiresAt: number }>((resolve) => {
+      releaseRefresh = resolve;
+    }));
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(new Uint8Array([1]), {
+      headers: { 'Content-Type': 'video/mp2t' },
+    }));
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      now: () => 3_480_000,
+      prefetchSegments: 0,
+      idGenerator: sequence('session', 'one', 'two'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\none.ts?signature=old\n#EXTINF:2,\ntwo.ts?signature=old\n', {
+      expiresAt: 3_600_000,
+      refresh,
+    }));
+
+    const first = proxy.getResource('session', 'one');
+    const second = proxy.getResource('session', 'two');
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    releaseRefresh!({
+      playlist: '#EXTM3U\n#EXTINF:2,\none.ts?signature=new\n#EXTINF:2,\ntwo.ts?signature=new\n',
+      sourceUrl: 'https://embed15.streamc.xyz/signed-playlist',
+      expiresAt: 7_200_000,
+    });
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+  });
+
+  it('uses the still-valid upstream resource when an early refresh fails', async () => {
+    const refresh = vi.fn(async () => undefined);
+    const fetcher = vi.fn<typeof fetch>(async (input) => new Response(
+      input instanceof URL && input.searchParams.get('signature') === 'old' ? new Uint8Array([1]) : new Uint8Array([9]),
+      { headers: { 'Content-Type': 'video/mp2t' } },
+    ));
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      now: () => 3_480_000,
+      prefetchSegments: 0,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts?signature=old\n', { expiresAt: 3_600_000, refresh }));
+
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ body: new Uint8Array([1]) });
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('removes an expired session when its refresh fails without fetching the stale resource', async () => {
+    let now = 0;
+    const refresh = vi.fn(async () => undefined);
+    const fetcher = vi.fn<typeof fetch>();
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      now: () => now,
+      prefetchSegments: 0,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.ts?signature=old\n', { expiresAt: 3_600_000, refresh }));
+    now = 3_600_001;
+
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({ status: 404, unavailable: 'session' });
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 });
 
-function sessionInput(playlist: string, overrides: Partial<{ expiresAt: number }> = {}) {
+function sessionInput(
+  playlist: string,
+  overrides: Partial<{
+    expiresAt: number;
+    refresh: () => Promise<{ playlist: string; sourceUrl: string; expiresAt: number } | undefined>;
+  }> = {},
+) {
   return {
     playlist,
     sourceUrl: 'https://embed15.streamc.xyz/signed-playlist',
     videoHash: 'e98bc48528bc4c91980a653c79e38b16',
     expiresAt: Date.now() + 60_000,
     decryptPlaylist: async (value: string) => value,
+    refresh: async () => undefined,
     ...overrides,
   };
 }

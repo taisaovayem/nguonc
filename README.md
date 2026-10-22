@@ -14,7 +14,7 @@ yarn start:dev
 
 Mở `http://localhost:3000/manifest.json` trong Stremio khi phát triển. `PUBLIC_BASE_URL` có thể là HTTP hoặc HTTPS; triển khai public vẫn nên dùng HTTPS. `GET /health` trả trạng thái dịch vụ.
 
-Các biến quan trọng: `NGUONC_API_BASE_URL`, `REQUEST_TIMEOUT_MS` và các TTL cache trong `.env.example`. `PUBLIC_BASE_URL` ghi nhận URL HTTPS công khai để vận hành/deploy. HLS tải sẵn 15 segment sau điểm phát/tua, với tối đa 3 segment tải song song trên toàn server; dữ liệu chưa được player lấy bị loại sau 30 phút, ngay khi được lấy thì bị loại khỏi cache. Có thể chỉnh bằng `HLS_REQUEST_TIMEOUT_MS`, `HLS_PREFETCH_SEGMENTS`, `HLS_PREFETCH_CONCURRENCY`, `HLS_PREFETCH_CACHE_BYTES` (mặc định 1 GiB) và `HLS_CACHE_IDLE_TTL_MS`.
+Các biến quan trọng: `NGUONC_API_BASE_URL`, `REQUEST_TIMEOUT_MS` và các TTL cache trong `.env.example`. `PUBLIC_BASE_URL` ghi nhận URL HTTPS công khai để vận hành/deploy. HLS tải sẵn 15 segment sau điểm phát/tua, với tối đa 3 segment tải song song trên toàn server; dữ liệu chưa được player lấy bị loại sau 30 phút, ngay khi được lấy thì bị loại khỏi cache. URL StreamC đang phát được làm mới trong RAM trước khi grant hết hạn 2 phút, nhưng sẽ hết hiệu lực nếu service restart. Có thể chỉnh bằng `HLS_REQUEST_TIMEOUT_MS`, `HLS_REFRESH_BEFORE_EXPIRY_MS` (mặc định 120000 ms), `HLS_PREFETCH_SEGMENTS`, `HLS_PREFETCH_CONCURRENCY`, `HLS_PREFETCH_CACHE_BYTES` (mặc định 1 GiB) và `HLS_CACHE_IDLE_TTL_MS`.
 
 ## Docker
 

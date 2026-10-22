@@ -4,6 +4,7 @@ import type { HlsProxyPort, HlsSessionInput } from './embed-resolver.js';
 export interface HlsProxyOptions {
   publicBaseUrl: string;
   timeoutMs?: number;
+  refreshBeforeExpiryMs?: number;
   prefetchSegments?: number;
   prefetchConcurrency?: number;
   cacheMaxBytes?: number;
@@ -25,6 +26,8 @@ export interface HlsProxyResponse {
 interface HlsSession {
   expiresAt: number;
   referer: string;
+  refresh: HlsSessionInput['refresh'];
+  refreshPromise?: Promise<boolean>;
   decryptPlaylist: HlsSessionInput['decryptPlaylist'];
   resources: Map<string, URL>;
   resourceIds: Map<string, string>;
@@ -56,6 +59,7 @@ interface PrefetchJob {
 export class HlsProxy implements HlsProxyPort {
   private readonly publicBaseUrl: URL;
   private readonly timeoutMs: number;
+  private readonly refreshBeforeExpiryMs: number;
   private readonly prefetchSegments: number;
   private readonly prefetchConcurrency: number;
   private readonly cacheMaxBytes: number;
@@ -72,6 +76,7 @@ export class HlsProxy implements HlsProxyPort {
   constructor(options: HlsProxyOptions) {
     this.publicBaseUrl = new URL(options.publicBaseUrl.endsWith('/') ? options.publicBaseUrl : `${options.publicBaseUrl}/`);
     this.timeoutMs = options.timeoutMs ?? 8_000;
+    this.refreshBeforeExpiryMs = Math.max(0, options.refreshBeforeExpiryMs ?? 2 * 60_000);
     this.prefetchSegments = Math.max(0, Math.floor(options.prefetchSegments ?? 15));
     this.prefetchConcurrency = Math.max(1, Math.floor(options.prefetchConcurrency ?? 3));
     this.cacheMaxBytes = options.cacheMaxBytes ?? 1024 * 1024 * 1024;
@@ -93,6 +98,7 @@ export class HlsProxy implements HlsProxyPort {
     const session: HlsSession = {
       expiresAt: input.expiresAt,
       referer,
+      refresh: input.refresh,
       decryptPlaylist: input.decryptPlaylist,
       resources: new Map(),
       resourceIds: new Map(),
@@ -114,11 +120,17 @@ export class HlsProxy implements HlsProxyPort {
   }
 
   getRootPlaylist(sessionId: string): string | undefined {
-    return this.getSession(sessionId)?.rootPlaylist;
+    const session = this.sessions.get(sessionId);
+    if (!session) return undefined;
+    if (session.expiresAt + this.refreshBeforeExpiryMs <= this.now()) {
+      this.deleteSession(sessionId, session);
+      return undefined;
+    }
+    return session.rootPlaylist;
   }
 
   async getResource(sessionId: string, resourceId: string, range?: string): Promise<HlsProxyResponse> {
-    const session = this.getSession(sessionId);
+    const session = await this.getSession(sessionId);
     if (!session) return { status: 404, body: new Uint8Array(), unavailable: 'session' };
     const sourceUrl = session.resources.get(resourceId);
     if (!sourceUrl) return { status: 404, body: new Uint8Array(), unavailable: 'resource' };
@@ -185,10 +197,43 @@ export class HlsProxy implements HlsProxyPort {
     };
   }
 
-  private getSession(sessionId: string): HlsSession | undefined {
+  private async getSession(sessionId: string): Promise<HlsSession | undefined> {
     const session = this.sessions.get(sessionId);
-    if (session && session.expiresAt <= this.now()) this.deleteSession(sessionId, session);
-    return this.sessions.get(sessionId);
+    if (!session) return undefined;
+
+    if (session.expiresAt - this.now() <= this.refreshBeforeExpiryMs) await this.refreshSession(sessionId, session);
+    if (session.expiresAt <= this.now()) {
+      this.deleteSession(sessionId, session);
+      return undefined;
+    }
+    return session;
+  }
+
+  private async refreshSession(sessionId: string, session: HlsSession): Promise<boolean> {
+    if (session.refreshPromise) return session.refreshPromise;
+    const refreshPromise = this.refreshSessionOnce(sessionId, session);
+    session.refreshPromise = refreshPromise;
+    try {
+      return await refreshPromise;
+    } finally {
+      if (session.refreshPromise === refreshPromise) session.refreshPromise = undefined;
+    }
+  }
+
+  private async refreshSessionOnce(sessionId: string, session: HlsSession): Promise<boolean> {
+    try {
+      const refreshed = await session.refresh();
+      if (!refreshed || refreshed.expiresAt <= this.now()) return false;
+      const rewritten = this.rewritePlaylist(sessionId, session, refreshed.playlist, refreshed.sourceUrl);
+      if (!rewritten) return false;
+      session.expiresAt = refreshed.expiresAt;
+      session.rootPlaylist = rewritten.body;
+      this.configurePrefetchTargets(session, rewritten.mediaResourceIds);
+      this.prefetchResources(sessionId, session, rewritten.mediaResourceIds);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private rewritePlaylist(sessionId: string, session: HlsSession, playlist: string, sourceUrl: string): RewrittenPlaylist | undefined {
@@ -206,13 +251,14 @@ export class HlsProxy implements HlsProxyPort {
       } catch {
         return undefined;
       }
-      const existing = session.resourceIds.get(url.toString());
+      const resourceKey = resourceIdentity(url);
+      const existing = session.resourceIds.get(resourceKey);
       const resourceId = existing ?? this.nextId();
       if (!resourceId) return undefined;
       if (!existing) {
-        session.resourceIds.set(url.toString(), resourceId);
-        session.resources.set(resourceId, url);
+        session.resourceIds.set(resourceKey, resourceId);
       }
+      session.resources.set(resourceId, url);
       return { path: new URL(`hls/${sessionId}/resource/${resourceId}`, this.publicBaseUrl).pathname, resourceId };
     };
 
@@ -334,7 +380,7 @@ export class HlsProxy implements HlsProxyPort {
   private purgeExpiredCache(): void {
     const now = this.now();
     for (const [sessionId, session] of this.sessions) {
-      if (session.expiresAt <= now) {
+      if (session.expiresAt + this.refreshBeforeExpiryMs <= now && !session.refreshPromise) {
         this.deleteSession(sessionId, session);
         continue;
       }
@@ -393,4 +439,8 @@ function playlistFilename(value: string | undefined): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return `${slug || 'playlist'}.m3u8`;
+}
+
+function resourceIdentity(url: URL): string {
+  return `${url.origin}${url.pathname}`;
 }
