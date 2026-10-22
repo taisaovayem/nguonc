@@ -8,8 +8,9 @@ export class HlsProxyService extends HlsProxy {
   constructor(config: ConfigService) {
     super({
       publicBaseUrl: publicBaseUrlSetting(config),
-      timeoutMs: numberSetting(config, 'REQUEST_TIMEOUT_MS', 8_000),
+      timeoutMs: numberSetting(config, 'HLS_REQUEST_TIMEOUT_MS', 25_000),
       prefetchSegments: numberSetting(config, 'HLS_PREFETCH_SEGMENTS', 15),
+      prefetchConcurrency: numberSetting(config, 'HLS_PREFETCH_CONCURRENCY', 3),
       cacheMaxBytes: numberSetting(config, 'HLS_PREFETCH_CACHE_BYTES', 1024 * 1024 * 1024),
       cacheIdleTtlMs: numberSetting(config, 'HLS_CACHE_IDLE_TTL_MS', 30 * 60_000),
     });

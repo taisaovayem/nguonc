@@ -5,6 +5,7 @@ export interface HlsProxyOptions {
   publicBaseUrl: string;
   timeoutMs?: number;
   prefetchSegments?: number;
+  prefetchConcurrency?: number;
   cacheMaxBytes?: number;
   cacheIdleTtlMs?: number;
   fetcher?: typeof fetch;
@@ -15,6 +16,7 @@ export interface HlsProxyOptions {
 export interface HlsProxyResponse {
   status: number;
   body: Uint8Array;
+  unavailable?: 'session' | 'resource';
   contentType?: string;
   contentRange?: string;
   contentLength?: string;
@@ -29,6 +31,7 @@ interface HlsSession {
   rootPlaylist: string;
   cachedResources: Map<string, CachedResource>;
   inFlightResources: Map<string, Promise<HlsProxyResponse>>;
+  queuedResourceIds: Set<string>;
   prefetchTargets: Map<string, string[]>;
   consumedResourceIds: Set<string>;
 }
@@ -44,10 +47,17 @@ interface RewrittenPlaylist {
 
 const BROWSER_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36';
 
+interface PrefetchJob {
+  sessionId: string;
+  session: HlsSession;
+  resourceId: string;
+}
+
 export class HlsProxy implements HlsProxyPort {
   private readonly publicBaseUrl: URL;
   private readonly timeoutMs: number;
   private readonly prefetchSegments: number;
+  private readonly prefetchConcurrency: number;
   private readonly cacheMaxBytes: number;
   private readonly cacheIdleTtlMs: number;
   private readonly fetcher: typeof fetch;
@@ -55,12 +65,15 @@ export class HlsProxy implements HlsProxyPort {
   private readonly idGenerator: () => string;
   private readonly sessions = new Map<string, HlsSession>();
   private readonly cacheCleanupTimer: NodeJS.Timeout;
+  private readonly prefetchQueue: PrefetchJob[] = [];
   private cachedBytes = 0;
+  private activePrefetches = 0;
 
   constructor(options: HlsProxyOptions) {
     this.publicBaseUrl = new URL(options.publicBaseUrl.endsWith('/') ? options.publicBaseUrl : `${options.publicBaseUrl}/`);
     this.timeoutMs = options.timeoutMs ?? 8_000;
     this.prefetchSegments = Math.max(0, Math.floor(options.prefetchSegments ?? 15));
+    this.prefetchConcurrency = Math.max(1, Math.floor(options.prefetchConcurrency ?? 3));
     this.cacheMaxBytes = options.cacheMaxBytes ?? 1024 * 1024 * 1024;
     this.cacheIdleTtlMs = options.cacheIdleTtlMs ?? 30 * 60_000;
     this.fetcher = options.fetcher ?? fetch;
@@ -86,6 +99,7 @@ export class HlsProxy implements HlsProxyPort {
       rootPlaylist: '',
       cachedResources: new Map(),
       inFlightResources: new Map(),
+      queuedResourceIds: new Set(),
       prefetchTargets: new Map(),
       consumedResourceIds: new Set(),
     };
@@ -103,12 +117,14 @@ export class HlsProxy implements HlsProxyPort {
     return this.getSession(sessionId)?.rootPlaylist;
   }
 
-  async getResource(sessionId: string, resourceId: string, range?: string): Promise<HlsProxyResponse | undefined> {
+  async getResource(sessionId: string, resourceId: string, range?: string): Promise<HlsProxyResponse> {
     const session = this.getSession(sessionId);
-    const sourceUrl = session?.resources.get(resourceId);
-    if (!session || !sourceUrl) return undefined;
+    if (!session) return { status: 404, body: new Uint8Array(), unavailable: 'session' };
+    const sourceUrl = session.resources.get(resourceId);
+    if (!sourceUrl) return { status: 404, body: new Uint8Array(), unavailable: 'resource' };
     const cached = range ? undefined : this.takeCachedResource(session, resourceId);
     session.consumedResourceIds.add(resourceId);
+    session.queuedResourceIds.delete(resourceId);
     if (range) this.removeCachedResource(session, resourceId);
 
     if (!range) {
@@ -246,10 +262,32 @@ export class HlsProxy implements HlsProxyPort {
   private prefetchResources(sessionId: string, session: HlsSession, resourceIds: string[]): void {
     this.purgeExpiredCache();
     for (const resourceId of resourceIds.slice(0, this.prefetchSegments)) {
-      if (session.consumedResourceIds.has(resourceId) || session.cachedResources.has(resourceId) || session.inFlightResources.has(resourceId)) continue;
-      const sourceUrl = session.resources.get(resourceId);
-      if (!sourceUrl) continue;
+      if (session.consumedResourceIds.has(resourceId)
+        || session.cachedResources.has(resourceId)
+        || session.inFlightResources.has(resourceId)
+        || session.queuedResourceIds.has(resourceId)
+        || !session.resources.has(resourceId)) continue;
+      session.queuedResourceIds.add(resourceId);
+      this.prefetchQueue.push({ sessionId, session, resourceId });
+    }
+    this.drainPrefetchQueue();
+  }
 
+  private drainPrefetchQueue(): void {
+    while (this.activePrefetches < this.prefetchConcurrency) {
+      const job = this.prefetchQueue.shift();
+      if (!job) return;
+      const { sessionId, session, resourceId } = job;
+      session.queuedResourceIds.delete(resourceId);
+      const sourceUrl = session.resources.get(resourceId);
+      if (this.sessions.get(sessionId) !== session
+        || session.expiresAt <= this.now()
+        || session.consumedResourceIds.has(resourceId)
+        || session.cachedResources.has(resourceId)
+        || session.inFlightResources.has(resourceId)
+        || !sourceUrl) continue;
+
+      this.activePrefetches += 1;
       const inFlight = this.fetchResource(sessionId, session, resourceId, sourceUrl);
       session.inFlightResources.set(resourceId, inFlight);
       void inFlight.then((resource) => {
@@ -257,7 +295,9 @@ export class HlsProxy implements HlsProxyPort {
           this.cacheResource(session, resourceId, resource);
         }
       }).catch(() => undefined).finally(() => {
-        session.inFlightResources.delete(resourceId);
+        if (session.inFlightResources.get(resourceId) === inFlight) session.inFlightResources.delete(resourceId);
+        this.activePrefetches -= 1;
+        this.drainPrefetchQueue();
       });
     }
   }
@@ -318,6 +358,10 @@ export class HlsProxy implements HlsProxyPort {
 
   private deleteSession(sessionId: string, session: HlsSession): void {
     for (const resourceId of session.cachedResources.keys()) this.removeCachedResource(session, resourceId);
+    session.queuedResourceIds.clear();
+    for (let index = this.prefetchQueue.length - 1; index >= 0; index -= 1) {
+      if (this.prefetchQueue[index].session === session) this.prefetchQueue.splice(index, 1);
+    }
     this.sessions.delete(sessionId);
   }
 

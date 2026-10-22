@@ -42,7 +42,7 @@ describe('HlsProxy', () => {
     expect(proxy.getRootPlaylist('session')).toBe('#EXTM3U\n#EXTINF:2,\n/addon/hls/session/resource/segment\n');
   });
 
-  it('returns no playlist for an expired session or unknown resource without fetching upstream', async () => {
+  it('identifies an expired session and an unknown resource without fetching upstream', async () => {
     const fetcher = vi.fn<typeof fetch>();
     const proxy = new HlsProxy({
       publicBaseUrl: 'https://nguonc.taisaovayem.com',
@@ -53,7 +53,10 @@ describe('HlsProxy', () => {
     proxy.createSession(sessionInput('#EXTM3U\n', { expiresAt: 999 }));
 
     expect(proxy.getRootPlaylist('expired')).toBeUndefined();
-    await expect(proxy.getResource('missing', 'resource')).resolves.toBeUndefined();
+    await expect(proxy.getResource('missing', 'resource')).resolves.toMatchObject({ status: 404, unavailable: 'session' });
+    const sessionUrl = proxy.createSession(sessionInput('#EXTM3U\n', { expiresAt: 2_000 }));
+    expect(sessionUrl).toBe('https://nguonc.taisaovayem.com/hls/expired/playlist.m3u8');
+    await expect(proxy.getResource('expired', 'missing')).resolves.toMatchObject({ status: 404, unavailable: 'resource' });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -197,6 +200,39 @@ describe('HlsProxy', () => {
     await vi.waitFor(() => expect(requests).toContain('https://embed15.streamc.xyz/four.ts'));
 
     await expect(proxy.getResource('session', 'four')).resolves.toMatchObject({ body: new Uint8Array([4]) });
+  });
+
+  it('limits concurrent prefetches while retaining the look-ahead queue', async () => {
+    let activeRequests = 0;
+    let peakActiveRequests = 0;
+    const releases: Array<() => void> = [];
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      activeRequests += 1;
+      peakActiveRequests = Math.max(peakActiveRequests, activeRequests);
+      await new Promise<void>((resolve) => releases.push(resolve));
+      activeRequests -= 1;
+      return new Response(new Uint8Array([1]), { headers: { 'Content-Type': 'video/mp2t' } });
+    });
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      prefetchSegments: 4,
+      prefetchConcurrency: 2,
+      idGenerator: sequence('session', 'one', 'two', 'three', 'four'),
+    });
+
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\none.ts\n#EXTINF:2,\ntwo.ts\n#EXTINF:2,\nthree.ts\n#EXTINF:2,\nfour.ts\n'));
+
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    expect(peakActiveRequests).toBe(2);
+
+    for (let index = 0; index < 4; index += 1) {
+      await vi.waitFor(() => expect(releases.length).toBeGreaterThan(0));
+      releases.shift()!();
+    }
+
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(4));
+    expect(peakActiveRequests).toBe(2);
   });
 
   it('discards an unused prefetched segment after its idle TTL', async () => {

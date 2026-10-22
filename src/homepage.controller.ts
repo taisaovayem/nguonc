@@ -144,7 +144,7 @@ export class HomepageController {
 
         const safeStreams = Array.isArray(streams) ? streams.filter((stream) => stream && isSafeUrl(stream.url)) : [];
         if (!safeStreams.length) {
-          content.append(element('p', 'empty', 'Không có link M3U8 khả dụng cho lựa chọn này.'));
+          content.append(element('p', 'empty', 'Không có link khả dụng cho lựa chọn này.'));
           return;
         }
         for (const stream of safeStreams) {
@@ -158,14 +158,14 @@ export class HomepageController {
           input.type = 'text';
           input.value = stream.url;
           input.readOnly = true;
-          input.setAttribute('aria-label', 'Link M3U8');
+          input.setAttribute('aria-label', 'Link');
           const copy = element('button', '', 'Sao chép');
           copy.type = 'button';
           copy.addEventListener('click', async () => {
             try {
               if (!navigator.clipboard) throw new Error('Clipboard unavailable');
               await navigator.clipboard.writeText(stream.url);
-              setStatus('Đã sao chép link M3U8.');
+              setStatus('Đã sao chép link');
             } catch {
               input.focus();
               input.select();
@@ -188,7 +188,7 @@ export class HomepageController {
           renderSources(payload && payload.streams, title);
         } catch {
           if (request !== requestNumber) return;
-          setStatus('Không thể lấy link M3U8. Vui lòng thử lại.');
+          setStatus('Không thể lấy link. Vui lòng thử lại.');
           clearContent();
         }
       }
