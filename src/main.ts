@@ -7,7 +7,7 @@ async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter());
   app.enableCors();
   const config = app.get(ConfigService);
-  await app.listen(numberSetting(config, 'PORT', 3000));
+  await app.listen(numberSetting(config, 'PORT', 3000), '0.0.0.0');
 }
 await bootstrap();
 
