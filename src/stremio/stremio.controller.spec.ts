@@ -17,6 +17,19 @@ describe('StremioController', () => {
     await app.close();
   });
 
+  it('serves the search interface at the root route', async () => {
+    const home = await app.inject({ method: 'GET', url: '/' });
+
+    expect(home.statusCode).toBe(200);
+    expect(home.headers['content-type']).toContain('text/html');
+    expect(home.body).toContain('<form id="search-form">');
+    expect(home.body).toContain('<input id="query" name="query" type="search"');
+    expect(home.body).toContain('<button type="submit">Tìm</button>');
+    expect(home.body).toContain('<p id="status" role="status" aria-live="polite"></p>');
+    expect(home.body).toContain('<section id="content" aria-live="polite"></section>');
+    expect(home.body).toContain('Sao chép');
+  });
+
   it('serves health and the Stremio manifest through Fastify with CORS', async () => {
     const health = await app.inject({ method: 'GET', url: '/health' });
     expect(health.statusCode).toBe(200);
