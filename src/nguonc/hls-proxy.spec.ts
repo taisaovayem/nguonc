@@ -96,6 +96,26 @@ describe('HlsProxy', () => {
     expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('referer')).toBe('https://embed15.streamc.xyz/');
   });
 
+  it('uses an HTTP embed origin as the referer for HTTP segment hosts', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(new Uint8Array([1]), {
+      headers: { 'Content-Type': 'video/mp2t' },
+    }));
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'http://localhost:3000',
+      fetcher,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession({
+      ...sessionInput('#EXTM3U\n#EXTINF:2,\nhttp://cdn.example/segment.ts\n'),
+      sourceUrl: 'http://cdn.example/playlist.m3u8',
+      refererUrl: 'http://embed.other.example/embed.php?hash=e98bc48528bc4c91980a653c79e38b16',
+    });
+
+    await proxy.getResource('session', 'segment');
+
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('referer')).toBe('http://embed.other.example/');
+  });
+
   it('rewrites a nested HLS manifest before returning it', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response('#EXTM3U\n#EXTINF:2,\nchunk.ts\n', {
       headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },

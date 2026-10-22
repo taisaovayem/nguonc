@@ -15,7 +15,6 @@ export interface HlsProxyPort {
 }
 
 export interface EmbedResolverOptions {
-  allowedHosts: string[];
   playlistPublisher?: HlsProxyPort;
   timeoutMs?: number;
   fetcher?: typeof fetch;
@@ -43,12 +42,10 @@ interface AesGcmEnvelope {
 const STREAMC_REFERRER = 'https://phim.nguonc.com/';
 
 export class EmbedResolver {
-  private readonly allowedHosts: Set<string>;
   private readonly timeoutMs: number;
   private readonly fetcher: typeof fetch;
 
   constructor(private readonly options: EmbedResolverOptions) {
-    this.allowedHosts = new Set(options.allowedHosts.map((host) => host.toLowerCase()));
     this.timeoutMs = options.timeoutMs ?? 8_000;
     this.fetcher = options.fetcher ?? fetch;
   }
@@ -57,13 +54,13 @@ export class EmbedResolver {
     if (!this.options.playlistPublisher) return undefined;
 
     const embed = parseEmbedUrl(embedUrl);
-    if (!embed || !this.isAllowedHost(embed.url.hostname)) return undefined;
+    if (!embed) return undefined;
 
     try {
       const bootstrap = await this.bootstrap(embed.url, embed.hash);
       if (!bootstrap) return undefined;
 
-      const grant = validateGrant(bootstrap.preissued, embed.url);
+      const grant = validateGrant(bootstrap.preissued);
       if (!grant) return undefined;
 
       const playlistResponse = await this.fetcher(grant.playlist, {
@@ -122,17 +119,13 @@ export class EmbedResolver {
     return isStreamBootstrap(bootstrap, embedUrl, videoHash) ? bootstrap : undefined;
   }
 
-  private isAllowedHost(hostname: string): boolean {
-    const host = hostname.toLowerCase();
-    return Array.from(this.allowedHosts).some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
-  }
 }
 
 function parseEmbedUrl(value: string): { url: URL; hash: string } | undefined {
   try {
     const url = new URL(value);
     const hash = url.searchParams.get('hash');
-    if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/embed.php' || !hash || !/^[a-f0-9]{32}$/i.test(hash)) {
+    if (!hash || !/^[a-f0-9]{32}$/i.test(hash)) {
       return undefined;
     }
     return { url, hash: hash.toLowerCase() };
@@ -202,7 +195,7 @@ function isStreamBootstrap(value: unknown, embedUrl: URL, videoHash: string): va
     && (!('preissued' in value) || isRecord(value.preissued));
 }
 
-function validateGrant(value: unknown, embedUrl: URL): PlaylistGrant | undefined {
+function validateGrant(value: unknown): PlaylistGrant | undefined {
   if (!isRecord(value)) return undefined;
   const { playlist: playlistValue, playlistFormat, issuedAt, expiresAt } = value;
   if (typeof playlistValue !== 'string'
@@ -216,7 +209,6 @@ function validateGrant(value: unknown, embedUrl: URL): PlaylistGrant | undefined
 
   try {
     const playlist = new URL(playlistValue);
-    if (playlist.protocol !== 'https:' || playlist.username || playlist.password || playlist.origin !== embedUrl.origin) return undefined;
     return {
       playlist: playlist.toString(),
       ...(typeof playlistFormat === 'string' ? { playlistFormat } : {}),

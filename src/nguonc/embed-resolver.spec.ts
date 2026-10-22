@@ -23,11 +23,7 @@ describe('EmbedResolver', () => {
       .mockResolvedValueOnce(new Response(JSON.stringify(bootstrap), { status: 200 }))
       .mockResolvedValueOnce(new Response(await encryptPlaylist(playlist, 'e98bc48528bc4c91980a653c79e38b16'), { status: 200 }));
     const playlistPublisher = { createSession: vi.fn(() => 'https://nguonc.taisaovayem.com/hls/session/playlist.m3u8') };
-    const resolver = new EmbedResolver({
-      allowedHosts: ['streamc.xyz'],
-      fetcher,
-      playlistPublisher,
-    });
+    const resolver = new EmbedResolver({ fetcher, playlistPublisher });
 
     await expect(resolver.resolve(embedUrl)).resolves.toBe(
       'https://nguonc.taisaovayem.com/hls/session/playlist.m3u8',
@@ -48,6 +44,8 @@ describe('EmbedResolver', () => {
       }),
     });
     expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('content-type')).toBe('application/json');
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('origin')).toBe('https://embed15.streamc.xyz');
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('referer')).toBe(embedUrl);
     expect(playlistPublisher.createSession).toHaveBeenCalledWith(expect.objectContaining({
       playlist,
       sourceUrl: signedPlaylistUrl,
@@ -56,10 +54,32 @@ describe('EmbedResolver', () => {
     }));
   });
 
-  it('does not fetch an embed URL from an unapproved host', async () => {
-    const resolver = new EmbedResolver({ allowedHosts: ['embed.example'] });
+  it('does not fetch a malformed embed URL without a video hash', async () => {
+    const resolver = new EmbedResolver({});
 
     await expect(resolver.resolve('https://untrusted.example/watch/abc')).resolves.toBeUndefined();
+  });
+
+  it('resolves an HTTP embed and follows its signed playlist on another host', async () => {
+    const embedUrl = 'http://embed.other.example/embed.php?hash=e98bc48528bc4c91980a653c79e38b16';
+    const signedPlaylistUrl = 'http://playlist.other.example/signed-playlist-token';
+    const bootstrap = await encryptBootstrap(embedUrl, {
+      api: embedUrl,
+      video: 'e98bc48528bc4c91980a653c79e38b16',
+      preissued: { playlist: signedPlaylistUrl, issuedAt: 1_800_000_000, expiresAt: 1_800_003_600 },
+    });
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify(bootstrap), { status: 200 }))
+      .mockResolvedValueOnce(new Response(await encryptPlaylist('#EXTM3U\n#EXTINF:2,\nsegment.ts\n', 'e98bc48528bc4c91980a653c79e38b16'), { status: 200 }));
+    const playlistPublisher = { createSession: vi.fn(() => 'http://localhost:3000/hls/session/playlist.m3u8') };
+    const resolver = new EmbedResolver({ fetcher, playlistPublisher });
+
+    const resolved = await resolver.resolve(embedUrl);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(resolved).toBe('http://localhost:3000/hls/session/playlist.m3u8');
+    expect(fetcher.mock.calls[1][0]).toBe(signedPlaylistUrl);
+    expect(new Headers(fetcher.mock.calls[1][1]?.headers).get('origin')).toBe('http://embed.other.example');
+    expect(new Headers(fetcher.mock.calls[1][1]?.headers).get('referer')).toBe(embedUrl);
   });
 });
 

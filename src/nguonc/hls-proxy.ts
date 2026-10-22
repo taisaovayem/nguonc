@@ -190,8 +190,6 @@ export class HlsProxy implements HlsProxyPort {
       } catch {
         return undefined;
       }
-      if (url.protocol !== 'https:' || url.username || url.password) return undefined;
-
       const existing = session.resourceIds.get(url.toString());
       const resourceId = existing ?? this.nextId();
       if (!resourceId) return undefined;
@@ -336,7 +334,7 @@ function startsWithHls(body: Uint8Array): boolean {
 function requestOrigin(value: string): string | undefined {
   try {
     const url = new URL(value);
-    return url.protocol === 'https:' && !url.username && !url.password ? `${url.origin}/` : undefined;
+    return `${url.origin}/`;
   } catch {
     return undefined;
   }

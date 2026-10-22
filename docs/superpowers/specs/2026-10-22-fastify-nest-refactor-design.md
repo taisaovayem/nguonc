@@ -80,7 +80,7 @@ Fastify integration tests use `app.inject()` instead of opening a Supertest serv
 
 ## Errors, safety, and lifecycle
 
-- Validation and source URL safety checks in the existing resolver/proxy remain unchanged.
+- Resolver and proxy retain only technical validation required to parse URLs and decrypt StreamC envelopes; they do not maintain a host allowlist or impose scheme/origin matching on upstream URLs returned by the configured source API.
 - An HLS cache failure is non-fatal: the proxy fetches the registered upstream resource normally and never exposes that upstream URL.
 - Cache `get` failures are treated as misses; cache `set`/`del` failures do not prevent playback, but leave no conflicting in-memory metadata.
 - Application shutdown clears the HLS cleanup interval. It does not delete active cache entries; their TTL handles cleanup.

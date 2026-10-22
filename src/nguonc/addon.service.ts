@@ -1,8 +1,9 @@
+import { Inject, Injectable } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { EmbedResolver } from './embed-resolver.js';
 import { mapMovieMeta } from './mapper.js';
-import { NguoncClientPort } from './nguonc.client.js';
+import type { NguoncClientPort } from './nguonc.client.js';
 import { NguoncMovie, StremioMeta } from './types.js';
-import { TtlCache } from './ttl-cache.js';
 
 export interface StremioStream {
   name: string;
@@ -17,22 +18,24 @@ export interface AddonCacheOptions {
   streamTtlMs?: number;
 }
 
-export class NguoncAddonService {
-  private readonly cache: TtlCache;
+interface CachePort {
+  get<T>(key: string): Promise<T | undefined>;
+  set<T>(key: string, value: T, ttl?: number): Promise<unknown>;
+}
 
+@Injectable()
+export class NguoncAddonService {
   constructor(
     private readonly client: NguoncClientPort,
     private readonly resolver: Pick<EmbedResolver, 'resolve'>,
-    cache = new TtlCache(),
+    @Inject(CACHE_MANAGER) private readonly cache: CachePort,
     private readonly cacheOptions: AddonCacheOptions = {},
-  ) {
-    this.cache = cache;
-  }
+  ) {}
 
   async catalog(type: 'movie' | 'series', search: string | undefined, skip = 0): Promise<StremioMeta[]> {
     const page = Math.floor(Math.max(skip, 0) / 10) + 1;
     const key = `catalog:${type}:${search ?? ''}:${page}`;
-    return this.cache.getOrLoad(key, this.cacheOptions.catalogTtlMs ?? 5 * 60_000, async () => {
+    return this.getOrLoad(key, this.cacheOptions.catalogTtlMs ?? 5 * 60_000, async () => {
       const list = search ? await this.client.search(search, page) : await this.client.listLatest(page);
       const details = await Promise.all(list.items.slice(0, 10).map((item) => this.detail(item.slug)));
       return details.filter((movie) => mapMovieMeta(movie).type === type).map(mapMovieMeta);
@@ -57,7 +60,7 @@ export class NguoncAddonService {
     );
     const resolved: Array<StremioStream | undefined> = await Promise.all(candidates.map(async ({ server, episode }) => {
       const playlistName = type === 'series' ? `${movie.name} Tập ${episode.name}` : movie.name;
-      const url = await this.cache.getOrLoad(
+      const url = await this.getOrLoad(
         `stream:${episode.embed}`,
         this.cacheOptions.streamTtlMs ?? 15 * 60_000,
         () => this.resolver.resolve(episode.embed, playlistName),
@@ -75,7 +78,24 @@ export class NguoncAddonService {
   }
 
   private detail(slug: string): Promise<NguoncMovie> {
-    return this.cache.getOrLoad(`detail:${slug}`, this.cacheOptions.detailTtlMs ?? 15 * 60_000, () => this.client.getMovie(slug));
+    return this.getOrLoad(`detail:${slug}`, this.cacheOptions.detailTtlMs ?? 15 * 60_000, () => this.client.getMovie(slug));
+  }
+
+  private async getOrLoad<T>(key: string, ttl: number, loader: () => Promise<T>): Promise<T> {
+    try {
+      const cached = await this.cache.get<T>(key);
+      if (cached !== undefined) return cached;
+    } catch {
+      // A cache outage must not prevent metadata or playback resolution.
+    }
+
+    const value = await loader();
+    try {
+      await this.cache.set(key, value, ttl);
+    } catch {
+      // The upstream value remains valid even when persisting it fails.
+    }
+    return value;
   }
 }
 
