@@ -14,6 +14,7 @@ export class HomepageController {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
   <title>NguồnC</title>
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111827; color: #f9fafb; }

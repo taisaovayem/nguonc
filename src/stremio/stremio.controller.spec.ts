@@ -22,12 +22,26 @@ describe('StremioController', () => {
 
     expect(home.statusCode).toBe(200);
     expect(home.headers['content-type']).toContain('text/html');
+    expect(home.headers['x-robots-tag']).toBe('noindex, nofollow, noarchive, nosnippet');
+    expect(home.body).toContain('<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">');
     expect(home.body).toContain('<form id="search-form">');
     expect(home.body).toContain('<input id="query" name="query" type="search"');
     expect(home.body).toContain('<button type="submit">Tìm</button>');
     expect(home.body).toContain('<p id="status" role="status" aria-live="polite"></p>');
     expect(home.body).toContain('<section id="content" aria-live="polite"></section>');
     expect(home.body).toContain('Sao chép');
+  });
+
+  it('tells compliant crawlers not to crawl or index the addon', async () => {
+    const robots = await app.inject({ method: 'GET', url: '/robots.txt' });
+
+    expect(robots.statusCode).toBe(200);
+    expect(robots.headers['content-type']).toContain('text/plain');
+    expect(robots.headers['x-robots-tag']).toBe('noindex, nofollow, noarchive, nosnippet');
+    expect(robots.body).toBe('User-agent: *\nDisallow: /\n');
+
+    const manifest = await app.inject({ method: 'GET', url: '/manifest.json' });
+    expect(manifest.headers['x-robots-tag']).toBe('noindex, nofollow, noarchive, nosnippet');
   });
 
   it('serves health and the Stremio manifest through Fastify with CORS', async () => {
