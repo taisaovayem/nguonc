@@ -2,12 +2,19 @@ import { webcrypto } from 'node:crypto';
 
 export interface HlsSessionInput {
   playlist: string;
-  playlistName?: string;
   sourceUrl: string;
-  refererUrl?: string;
   expiresAt: number;
-  videoHash: string;
+  refresh: () => Promise<HlsSessionRefresh | undefined>;
   decryptPlaylist: (encryptedPlaylist: string) => Promise<string>;
+  videoHash: string;
+  playlistName?: string;
+  refererUrl?: string;
+}
+
+export interface HlsSessionRefresh {
+  playlist: string;
+  sourceUrl: string;
+  expiresAt: number;
 }
 
 export interface HlsProxyPort {
@@ -15,7 +22,6 @@ export interface HlsProxyPort {
 }
 
 export interface EmbedResolverOptions {
-  allowedHosts: string[];
   playlistPublisher?: HlsProxyPort;
   timeoutMs?: number;
   fetcher?: typeof fetch;
@@ -43,12 +49,10 @@ interface AesGcmEnvelope {
 const STREAMC_REFERRER = 'https://phim.nguonc.com/';
 
 export class EmbedResolver {
-  private readonly allowedHosts: Set<string>;
   private readonly timeoutMs: number;
   private readonly fetcher: typeof fetch;
 
   constructor(private readonly options: EmbedResolverOptions) {
-    this.allowedHosts = new Set(options.allowedHosts.map((host) => host.toLowerCase()));
     this.timeoutMs = options.timeoutMs ?? 8_000;
     this.fetcher = options.fetcher ?? fetch;
   }
@@ -57,39 +61,18 @@ export class EmbedResolver {
     if (!this.options.playlistPublisher) return undefined;
 
     const embed = parseEmbedUrl(embedUrl);
-    if (!embed || !this.isAllowedHost(embed.url.hostname)) return undefined;
+    if (!embed) return undefined;
 
     try {
-      const bootstrap = await this.bootstrap(embed.url, embed.hash);
-      if (!bootstrap) return undefined;
-
-      const grant = validateGrant(bootstrap.preissued, embed.url);
-      if (!grant) return undefined;
-
-      const playlistResponse = await this.fetcher(grant.playlist, {
-        headers: streamHeaders(embed.url),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-      if (!playlistResponse.ok) return undefined;
-
-      const decryptPlaylist = async (encryptedPlaylist: string) => {
-        if (encryptedPlaylist.includes('#ENC-AESGCM') || encryptedPlaylist.includes('#EXT-X-B65')) {
-          return decryptStreamPlaylist(encryptedPlaylist, embed.hash);
-        }
-        if (!encryptedPlaylist.startsWith('#EXTM3U\\n') && !encryptedPlaylist.startsWith('#EXTM3U\\r\\n')) {
-          throw new Error('Expected an HLS playlist');
-        }
-        return encryptedPlaylist;
-      };
-      const playlist = await decryptPlaylist(await playlistResponse.text());
+      const refreshed = await this.loadPlaylist(embed.url, embed.hash);
+      if (!refreshed) return undefined;
       return this.options.playlistPublisher.createSession({
-        playlist,
+        ...refreshed,
         playlistName,
-        sourceUrl: playlistResponse.url || grant.playlist,
         refererUrl: embed.url.toString(),
-        expiresAt: grant.expiresAt * 1_000,
         videoHash: embed.hash,
-        decryptPlaylist,
+        decryptPlaylist: (encryptedPlaylist) => decryptPlaylistForVideo(encryptedPlaylist, embed.hash),
+        refresh: () => this.loadPlaylist(embed.url, embed.hash),
       });
     } catch {
       return undefined;
@@ -122,17 +105,33 @@ export class EmbedResolver {
     return isStreamBootstrap(bootstrap, embedUrl, videoHash) ? bootstrap : undefined;
   }
 
-  private isAllowedHost(hostname: string): boolean {
-    const host = hostname.toLowerCase();
-    return Array.from(this.allowedHosts).some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
+  private async loadPlaylist(embedUrl: URL, videoHash: string): Promise<HlsSessionRefresh | undefined> {
+    const bootstrap = await this.bootstrap(embedUrl, videoHash);
+    if (!bootstrap) return undefined;
+
+    const grant = validateGrant(bootstrap.preissued);
+    if (!grant) return undefined;
+
+    const playlistResponse = await this.fetcher(grant.playlist, {
+      headers: streamHeaders(embedUrl),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!playlistResponse.ok) return undefined;
+
+    return {
+      playlist: await decryptPlaylistForVideo(await playlistResponse.text(), videoHash),
+      sourceUrl: playlistResponse.url || grant.playlist,
+      expiresAt: grant.expiresAt * 1_000,
+    };
   }
+
 }
 
 function parseEmbedUrl(value: string): { url: URL; hash: string } | undefined {
   try {
     const url = new URL(value);
     const hash = url.searchParams.get('hash');
-    if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/embed.php' || !hash || !/^[a-f0-9]{32}$/i.test(hash)) {
+    if (!hash || !/^[a-f0-9]{32}$/i.test(hash)) {
       return undefined;
     }
     return { url, hash: hash.toLowerCase() };
@@ -177,6 +176,16 @@ async function decryptStreamPlaylist(playlist: string, videoHash: string): Promi
   return decrypted;
 }
 
+async function decryptPlaylistForVideo(playlist: string, videoHash: string): Promise<string> {
+  if (playlist.includes('#ENC-AESGCM') || playlist.includes('#EXT-X-B65')) {
+    return decryptStreamPlaylist(playlist, videoHash);
+  }
+  if (!playlist.startsWith('#EXTM3U\n') && !playlist.startsWith('#EXTM3U\r\n')) {
+    throw new Error('Expected an HLS playlist');
+  }
+  return playlist;
+}
+
 async function decryptAesGcm(envelope: AesGcmEnvelope, keyMaterial: BufferSource, additionalData?: Uint8Array): Promise<string> {
   const iv = Buffer.from(envelope.iv, 'hex');
   const ciphertext = Buffer.from(envelope.data, 'base64');
@@ -202,7 +211,7 @@ function isStreamBootstrap(value: unknown, embedUrl: URL, videoHash: string): va
     && (!('preissued' in value) || isRecord(value.preissued));
 }
 
-function validateGrant(value: unknown, embedUrl: URL): PlaylistGrant | undefined {
+function validateGrant(value: unknown): PlaylistGrant | undefined {
   if (!isRecord(value)) return undefined;
   const { playlist: playlistValue, playlistFormat, issuedAt, expiresAt } = value;
   if (typeof playlistValue !== 'string'
@@ -216,7 +225,6 @@ function validateGrant(value: unknown, embedUrl: URL): PlaylistGrant | undefined
 
   try {
     const playlist = new URL(playlistValue);
-    if (playlist.protocol !== 'https:' || playlist.username || playlist.password || playlist.origin !== embedUrl.origin) return undefined;
     return {
       playlist: playlist.toString(),
       ...(typeof playlistFormat === 'string' ? { playlistFormat } : {}),
