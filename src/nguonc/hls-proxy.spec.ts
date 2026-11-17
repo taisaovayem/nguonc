@@ -79,7 +79,29 @@ describe('HlsProxy', () => {
     expect(fetcher.mock.calls.some(([, options]) => new Headers(options?.headers).get('range') === 'bytes=100-')).toBe(true);
   });
 
-  it('uses the embed origin as the referer for CDN-hosted segments', async () => {
+  it('serves a PNG-labelled MPEG-TS segment with a video MIME type', async () => {
+    const transportStream = new Uint8Array(377);
+    transportStream[0] = 0x47;
+    transportStream[188] = 0x47;
+    transportStream[376] = 0x47;
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(transportStream, {
+      headers: { 'Content-Type': 'image/png' },
+    }));
+    const proxy = new HlsProxy({
+      publicBaseUrl: 'https://nguonc.taisaovayem.com',
+      fetcher,
+      prefetchSegments: 0,
+      idGenerator: sequence('session', 'segment'),
+    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nsegment.png\n'));
+
+    await expect(proxy.getResource('session', 'segment')).resolves.toMatchObject({
+      contentType: 'video/mp2t',
+      body: transportStream,
+    });
+  });
+
+  it('uses the embed page URL as the referer for CDN-hosted segments', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(new Uint8Array([1]), {
       headers: { 'Content-Type': 'video/mp2t' },
     }));
@@ -96,10 +118,13 @@ describe('HlsProxy', () => {
 
     await proxy.getResource('session', 'segment');
 
-    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('referer')).toBe('https://embed15.streamc.xyz/');
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('referer')).toBe(
+      'https://embed15.streamc.xyz/embed.php?hash=e98bc48528bc4c91980a653c79e38b16',
+    );
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('origin')).toBe('https://embed15.streamc.xyz');
   });
 
-  it('uses an HTTP embed origin as the referer for HTTP segment hosts', async () => {
+  it('uses the source origin as the referer when no embed page URL is provided', async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(new Uint8Array([1]), {
       headers: { 'Content-Type': 'video/mp2t' },
     }));
@@ -108,15 +133,11 @@ describe('HlsProxy', () => {
       fetcher,
       idGenerator: sequence('session', 'segment'),
     });
-    proxy.createSession({
-      ...sessionInput('#EXTM3U\n#EXTINF:2,\nhttp://cdn.example/segment.ts\n'),
-      sourceUrl: 'http://cdn.example/playlist.m3u8',
-      refererUrl: 'http://embed.other.example/embed.php?hash=e98bc48528bc4c91980a653c79e38b16',
-    });
+    proxy.createSession(sessionInput('#EXTM3U\n#EXTINF:2,\nhttp://cdn.example/segment.ts\n'));
 
     await proxy.getResource('session', 'segment');
 
-    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('referer')).toBe('http://embed.other.example/');
+    expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('referer')).toBe('https://embed15.streamc.xyz');
   });
 
   it('rewrites a nested HLS manifest before returning it', async () => {

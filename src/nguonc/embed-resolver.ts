@@ -1,4 +1,5 @@
 import { webcrypto } from 'node:crypto';
+import { browserFetch, type UpstreamFetcher } from './browser-fetch.js';
 
 export interface HlsSessionInput {
   playlist: string;
@@ -24,7 +25,7 @@ export interface HlsProxyPort {
 export interface EmbedResolverOptions {
   playlistPublisher?: HlsProxyPort;
   timeoutMs?: number;
-  fetcher?: typeof fetch;
+  fetcher?: UpstreamFetcher;
 }
 
 interface StreamBootstrap {
@@ -50,11 +51,11 @@ const STREAMC_REFERRER = 'https://phim.nguonc.com/';
 
 export class EmbedResolver {
   private readonly timeoutMs: number;
-  private readonly fetcher: typeof fetch;
+  private readonly fetcher: UpstreamFetcher;
 
   constructor(private readonly options: EmbedResolverOptions) {
     this.timeoutMs = options.timeoutMs ?? 8_000;
-    this.fetcher = options.fetcher ?? fetch;
+    this.fetcher = options.fetcher ?? browserFetch;
   }
 
   async resolve(embedUrl: string, playlistName?: string): Promise<string | undefined> {

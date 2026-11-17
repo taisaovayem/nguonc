@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { HlsProxyPort, HlsSessionInput } from './embed-resolver.js';
+import { browserFetch, type UpstreamFetcher } from './browser-fetch.js';
 
 export interface HlsProxyOptions {
   publicBaseUrl: string;
@@ -9,7 +10,7 @@ export interface HlsProxyOptions {
   prefetchConcurrency?: number;
   cacheMaxBytes?: number;
   cacheIdleTtlMs?: number;
-  fetcher?: typeof fetch;
+  fetcher?: UpstreamFetcher;
   now?: () => number;
   idGenerator?: () => string;
 }
@@ -64,7 +65,7 @@ export class HlsProxy implements HlsProxyPort {
   private readonly prefetchConcurrency: number;
   private readonly cacheMaxBytes: number;
   private readonly cacheIdleTtlMs: number;
-  private readonly fetcher: typeof fetch;
+  private readonly fetcher: UpstreamFetcher;
   private readonly now: () => number;
   private readonly idGenerator: () => string;
   private readonly sessions = new Map<string, HlsSession>();
@@ -81,7 +82,7 @@ export class HlsProxy implements HlsProxyPort {
     this.prefetchConcurrency = Math.max(1, Math.floor(options.prefetchConcurrency ?? 3));
     this.cacheMaxBytes = options.cacheMaxBytes ?? 1024 * 1024 * 1024;
     this.cacheIdleTtlMs = options.cacheIdleTtlMs ?? 30 * 60_000;
-    this.fetcher = options.fetcher ?? fetch;
+    this.fetcher = options.fetcher ?? browserFetch;
     this.now = options.now ?? Date.now;
     this.idGenerator = options.idGenerator ?? randomUUID;
     this.cacheCleanupTimer = setInterval(() => this.purgeExpiredCache(), Math.max(1_000, Math.min(this.cacheIdleTtlMs, 60_000)));
@@ -92,7 +93,7 @@ export class HlsProxy implements HlsProxyPort {
     if (input.expiresAt <= this.now()) return undefined;
     const sessionId = this.nextId();
     if (!sessionId) return undefined;
-    const referer = requestOrigin(input.refererUrl ?? input.sourceUrl);
+    const referer = upstreamReferer(input.refererUrl, input.sourceUrl);
     if (!referer) return undefined;
 
     const session: HlsSession = {
@@ -168,16 +169,11 @@ export class HlsProxy implements HlsProxyPort {
   ): Promise<HlsProxyResponse> {
 
     const response = await this.fetcher(sourceUrl, {
-      headers: {
-        Accept: '*/*',
-        Referer: session.referer,
-        'User-Agent': BROWSER_USER_AGENT,
-        ...(range ? { Range: range } : {}),
-      },
+      headers: upstreamMediaHeaders(session.referer, range),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     const body = new Uint8Array(await response.arrayBuffer());
-    const contentType = response.headers.get('content-type') ?? undefined;
+    const contentType = isMpegTransportStream(body) ? 'video/mp2t' : response.headers.get('content-type') ?? undefined;
     const isHls = contentType?.includes('mpegurl') || startsWithHls(body);
     if (isHls && response.ok) {
       const decrypted = await session.decryptPlaylist(new TextDecoder('utf-8', { fatal: true }).decode(body));
@@ -425,13 +421,39 @@ function startsWithHls(body: Uint8Array): boolean {
   return new TextDecoder().decode(body.slice(0, 8)).startsWith('#EXTM3U');
 }
 
-function requestOrigin(value: string): string | undefined {
+function isMpegTransportStream(body: Uint8Array): boolean {
+  return body.length >= 377 && body[0] === 0x47 && body[188] === 0x47 && body[376] === 0x47;
+}
+
+function upstreamReferer(refererUrl: string | undefined, sourceUrl: string): string | undefined {
+  if (refererUrl) {
+    try {
+      return new URL(refererUrl).toString();
+    } catch {
+      return undefined;
+    }
+  }
+  return embedOrigin(sourceUrl);
+}
+
+function embedOrigin(value: string): string | undefined {
   try {
-    const url = new URL(value);
-    return `${url.origin}/`;
+    return new URL(value).origin;
   } catch {
     return undefined;
   }
+}
+
+function upstreamMediaHeaders(referer: string, range?: string): HeadersInit {
+  const headers: Record<string, string> = {
+    Accept: '*/*',
+    Referer: referer,
+    'User-Agent': BROWSER_USER_AGENT,
+    ...(range ? { Range: range } : {}),
+  };
+  const origin = embedOrigin(referer);
+  if (origin) headers.Origin = origin;
+  return headers;
 }
 
 function playlistFilename(value: string | undefined): string {
